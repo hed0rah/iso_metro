@@ -1,0 +1,833 @@
+<div style="background:#faf8f3;padding:8px;border-radius:6px;border:1px solid #cdbf9c">
+<div style="font-size:11px;color:#6e5d36;letter-spacing:1.2px;text-transform:uppercase;margin-bottom:8px">iso transit editor &middot; live test</div>
+<iframe id="iso-editor-frame" style="width:100%;height:580px;border:1px solid #cdbf9c;border-radius:4px;background:#faf8f3;display:block"></iframe>
+<textarea id="iso-editor-src" hidden>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>iso transit editor</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; font-family: Inter, Helvetica, Arial, sans-serif;
+  background: #faf8f3; color: #1a1a1a; overflow: hidden; }
+#app { display: flex; height: 100vh; }
+#sidebar { width: 280px; background: #f0eadf; border-right: 1px solid #cdbf9c;
+  padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px;
+  font-size: 13px; }
+#sidebar h1 { font-size: 16px; font-weight: 600; letter-spacing: -0.4px; }
+#sidebar h2 { font-size: 11px; font-weight: 600; letter-spacing: 1.4px;
+  text-transform: uppercase; color: #6e5d36; margin-bottom: 6px; }
+#main { flex: 1; position: relative; }
+#canvas-container { position: absolute; inset: 0; }
+#hud { position: absolute; top: 14px; right: 14px; background: rgba(255,255,255,0.85);
+  padding: 8px 12px; border-radius: 6px; font-size: 11px; line-height: 1.6;
+  border: 1px solid #cdbf9c; pointer-events: none; }
+.btn { background: #fff; border: 1px solid #cdbf9c; padding: 6px 10px; cursor: pointer;
+  font-family: inherit; font-size: 12px; border-radius: 4px; text-align: left; }
+.btn:hover { background: #ece5d6; }
+.btn.active { background: #1a1a1a; color: #fff; border-color: #1a1a1a; }
+.row { display: flex; gap: 6px; flex-wrap: wrap; }
+.row .btn { flex: 1; text-align: center; }
+.line-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+  background: #fff; border: 1px solid #cdbf9c; border-radius: 4px; cursor: pointer;
+  border-left-width: 4px; font-size: 12px; }
+.line-item.active { background: #1a1a1a; color: #fff; }
+.line-item input { flex: 1; background: transparent; border: none;
+  font-family: inherit; font-size: 12px; color: inherit; }
+.line-item input:focus { outline: 1px solid #999; }
+.swatch { width: 14px; height: 14px; border-radius: 50%; border: 1px solid #1a1a1a;
+  flex-shrink: 0; cursor: pointer; }
+#export, #save, #load, #new-line { width: 100%; padding: 8px; }
+.kb { background: #1a1a1a; color: #fff; padding: 2px 5px; border-radius: 3px;
+  font-family: monospace; font-size: 10px; }
+input[type=file] { display: none; }
+</style>
+</head>
+<body>
+<div id="app">
+<aside id="sidebar">
+<h1>iso transit editor</h1>
+<div>
+<h2>mode</h2>
+<div class="row" id="mode-row"></div>
+</div>
+<div>
+<h2>plane</h2>
+<div class="row" id="plane-row"></div>
+</div>
+<div>
+<h2>lines</h2>
+<div id="line-list"></div>
+<button class="btn" id="new-line" style="margin-top:8px">+ new line</button>
+</div>
+<div>
+<h2>file</h2>
+<button class="btn" id="export">export svg</button>
+<button class="btn" id="save" style="margin-top:6px">save json</button>
+<label class="btn" for="load-input" style="margin-top:6px;display:block;text-align:center">load json</label>
+<input type="file" id="load-input" accept=".json">
+</div>
+<div>
+<h2>shortcuts</h2>
+<div style="font-size:11px; line-height:1.7; color:#444">
+<span class="kb">d</span> draw &nbsp;
+<span class="kb">m</span> move &nbsp;
+<span class="kb">x</span> delete<br>
+<span class="kb">1</span><span class="kb">2</span><span class="kb">3</span> plane<br>
+<span class="kb">drag</span> rotate &nbsp;
+<span class="kb">shift+drag</span> pan<br>
+<span class="kb">wheel</span> zoom &nbsp;
+<span class="kb">esc</span> deselect
+</div>
+</div>
+</aside>
+<main id="main">
+<div id="canvas-container"></div>
+<div id="hud"></div>
+</main>
+</div>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// data model. world coords are (gx, gy, plane).
+// plane is index into PLANES; gx/gy are integer grid units inside the plane.
+const PLANE_GAP = 3.6;
+const PLANES = [
+  { name: 'Surface',   z: 0 },
+  { name: 'Mid Level', z: PLANE_GAP },
+  { name: 'Sky Lines', z: PLANE_GAP * 2 },
+];
+const TRACK_SPACING = 0.20;
+const STATION_R = 0.18;
+const INTERCHANGE_R = 0.32;
+
+const data = {
+  lines: [
+    { id: 'vco', name: 'VCO', color: '#d62828', waypoints: [
+      {gx:-7,gy:-4,plane:0}, {gx:6,gy:-4,plane:0}] },
+    { id: 'vcf', name: 'VCF', color: '#1565c0', waypoints: [
+      {gx:-3,gy:-5,plane:0}, {gx:-3,gy:5,plane:0}] },
+    { id: 'vca', name: 'VCA', color: '#2e7d32', waypoints: [
+      {gx:-6,gy:5,plane:0}, {gx:-3,gy:2,plane:0},
+      {gx:1,gy:-2,plane:0}, {gx:5,gy:-2,plane:0}] },
+    { id: 'bus', name: 'BUS', color: '#5d4037', waypoints: [
+      {gx:-5,gy:-4,plane:0}, {gx:-3,gy:-4,plane:0},
+      {gx:-3,gy:2,plane:0}, {gx:-1,gy:4,plane:0}] },
+    { id: 'lfo', name: 'LFO', color: '#f9a825', waypoints: [
+      {gx:-6,gy:-2,plane:1}, {gx:6,gy:-2,plane:1}] },
+    { id: 'eg',  name: 'EG',  color: '#c2185b', waypoints: [
+      {gx:2,gy:-4,plane:1}, {gx:2,gy:5,plane:1}] },
+    { id: 'mix', name: 'MIX', color: '#00838f', waypoints: [
+      {gx:-5,gy:4,plane:1}, {gx:-1,gy:0,plane:1}, {gx:4,gy:0,plane:1}] },
+    { id: 'trk', name: 'TRK', color: '#37474f', waypoints: [
+      {gx:-3,gy:-2,plane:1}, {gx:2,gy:-2,plane:1}, {gx:2,gy:4,plane:1}] },
+    { id: 'smp', name: 'SMP', color: '#6a1b9a', waypoints: [
+      {gx:-5,gy:-1,plane:2}, {gx:5,gy:-1,plane:2}] },
+    { id: 'seq', name: 'SEQ', color: '#ef6c00', waypoints: [
+      {gx:-3,gy:4,plane:2}, {gx:-3,gy:1,plane:2},
+      {gx:3,gy:1,plane:2}, {gx:3,gy:4,plane:2}] },
+  ],
+  stations: [],
+  lifts: [],
+};
+
+// editor state
+let mode = 'draw';
+let activePlane = 0;
+let activeLineId = 'vco';
+let dragging = null;       // {lineIndex, wpIndex} when moving
+let hoverCell = null;      // {gx, gy, plane}
+let liftPending = null;    // first picked waypoint for lift mode
+
+const palette = ['#d62828','#1565c0','#2e7d32','#5d4037','#f9a825',
+  '#c2185b','#00838f','#37474f','#6a1b9a','#ef6c00','#558b2f','#7b1fa2'];
+
+// three.js scene
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xfaf8f3);
+
+const container = document.getElementById('canvas-container');
+const aspect = () => container.clientWidth / container.clientHeight;
+const FRUSTUM = 22;
+const camera = new THREE.OrthographicCamera(
+  -FRUSTUM*aspect()/2, FRUSTUM*aspect()/2, FRUSTUM/2, -FRUSTUM/2, 0.1, 1000);
+camera.position.set(20, 16, 20);
+camera.lookAt(0, PLANE_GAP, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(container.clientWidth, container.clientHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+container.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 1));
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.12;
+controls.target.set(0, PLANE_GAP, 0);
+controls.mouseButtons = {
+  LEFT: null,                    // left is for editing
+  MIDDLE: THREE.MOUSE.DOLLY,
+  RIGHT: THREE.MOUSE.ROTATE,
+};
+// shift+left to pan via custom hook below
+
+// plane meshes (also clickable surfaces)
+const planeMeshes = [];
+const planeGroup = new THREE.Group();
+scene.add(planeGroup);
+
+function buildPlanes() {
+  while (planeGroup.children.length) planeGroup.remove(planeGroup.children[0]);
+  planeMeshes.length = 0;
+  PLANES.forEach((p, i) => {
+    const w = 18, h = 14;
+    const g = new THREE.PlaneGeometry(w, h);
+    const tints = [0xf0eadf, 0xece5d6, 0xe8e0cd];
+    const m = new THREE.MeshBasicMaterial({
+      color: tints[i], transparent: true, opacity: i === activePlane ? 0.55 : 0.22,
+      side: THREE.DoubleSide,
+    });
+    const mesh = new THREE.Mesh(g, m);
+    mesh.rotation.x = -Math.PI/2;
+    mesh.position.y = p.z;
+    mesh.userData = { planeIndex: i, isPlane: true };
+    planeGroup.add(mesh);
+    planeMeshes.push(mesh);
+    // grid
+    const grid = new THREE.GridHelper(w, w, 0xcdbf9c, 0xddd6c2);
+    grid.position.y = p.z + 0.001;
+    grid.material.opacity = i === activePlane ? 0.6 : 0.25;
+    grid.material.transparent = true;
+    planeGroup.add(grid);
+    // plane label as a small square in the back left corner
+    const corner = document.createElement('div');
+  });
+}
+
+// renderable groups, rebuilt on data changes
+const linesGroup = new THREE.Group();
+const stationsGroup = new THREE.Group();
+const liftsGroup = new THREE.Group();
+const editGroup = new THREE.Group();   // hover preview + selection rings
+scene.add(linesGroup, stationsGroup, liftsGroup, editGroup);
+
+function clearGroup(g) { while (g.children.length) g.remove(g.children[0]); }
+
+function wpToWorld(wp, off) {
+  off = off || {x: 0, y: 0};
+  return new THREE.Vector3(wp.gx + off.x, PLANES[wp.plane].z + 0.04, wp.gy + off.y);
+}
+
+// build dict of canonical edge -> [line ids]
+function buildCorridors() {
+  const m = new Map();
+  for (const ln of data.lines) {
+    for (let i = 0; i < ln.waypoints.length - 1; i++) {
+      const a = ln.waypoints[i], b = ln.waypoints[i+1];
+      if (a.plane !== b.plane) continue;
+      const p1 = (a.gx < b.gx) || (a.gx === b.gx && a.gy <= b.gy)
+        ? [a.gx, a.gy] : [b.gx, b.gy];
+      const p2 = (p1[0] === a.gx && p1[1] === a.gy)
+        ? [b.gx, b.gy] : [a.gx, a.gy];
+      const k = `${a.plane}|${p1[0]},${p1[1]}|${p2[0]},${p2[1]}`;
+      let arr = m.get(k);
+      if (!arr) { arr = { lines: [], plane: a.plane, p1, p2 }; m.set(k, arr); }
+      if (!arr.lines.includes(ln.id)) arr.lines.push(ln.id);
+    }
+  }
+  return m;
+}
+
+// perpendicular offset for one line on one edge (in grid units)
+function edgeOffset(a, b, lineId, corridors) {
+  if (a.plane !== b.plane) return {x: 0, y: 0};
+  const p1 = (a.gx < b.gx) || (a.gx === b.gx && a.gy <= b.gy)
+    ? [a.gx, a.gy] : [b.gx, b.gy];
+  const p2 = (p1[0] === a.gx && p1[1] === a.gy)
+    ? [b.gx, b.gy] : [a.gx, a.gy];
+  const k = `${a.plane}|${p1[0]},${p1[1]}|${p2[0]},${p2[1]}`;
+  const cor = corridors.get(k);
+  if (!cor || cor.lines.length < 2) return {x: 0, y: 0};
+  const slot = cor.lines.indexOf(lineId);
+  const n = cor.lines.length;
+  const amount = (slot - (n - 1) / 2) * TRACK_SPACING;
+  const dx = p2[0] - p1[0], dy = p2[1] - p1[1];
+  const L = Math.hypot(dx, dy);
+  if (L < 1e-6) return {x: 0, y: 0};
+  return { x: -dy / L * amount, y: dx / L * amount };
+}
+
+// average of incident edge offsets at a waypoint
+function waypointOffset(line, i, corridors) {
+  const wps = line.waypoints;
+  const offs = [];
+  if (i > 0 && wps[i-1].plane === wps[i].plane)
+    offs.push(edgeOffset(wps[i-1], wps[i], line.id, corridors));
+  if (i < wps.length - 1 && wps[i+1].plane === wps[i].plane)
+    offs.push(edgeOffset(wps[i], wps[i+1], line.id, corridors));
+  if (!offs.length) return {x: 0, y: 0};
+  return {
+    x: offs.reduce((a, o) => a + o.x, 0) / offs.length,
+    y: offs.reduce((a, o) => a + o.y, 0) / offs.length,
+  };
+}
+
+function rebuildLines() {
+  clearGroup(linesGroup);
+  const corridors = buildCorridors();
+  for (const ln of data.lines) {
+    if (ln.waypoints.length === 0) continue;
+    const mat = new THREE.MeshBasicMaterial({ color: ln.color });
+    const group = new THREE.Group();
+    group.userData = { lineId: ln.id };
+    const positions = ln.waypoints.map((wp, i) =>
+      wpToWorld(wp, waypointOffset(ln, i, corridors)));
+    for (let i = 0; i < positions.length - 1; i++) {
+      const a = positions[i], b = positions[i+1];
+      const dir = new THREE.Vector3().subVectors(b, a);
+      const len = dir.length();
+      if (len < 1e-6) continue;
+      const cyl = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.13, 0.13, len, 8), mat);
+      cyl.position.copy(a).addScaledVector(dir, 0.5);
+      cyl.quaternion.setFromUnitVectors(
+        new THREE.Vector3(0,1,0), dir.clone().normalize());
+      group.add(cyl);
+    }
+    for (let i = 0; i < positions.length; i++) {
+      const s = new THREE.Mesh(
+        new THREE.SphereGeometry(0.13, 12, 12), mat);
+      s.position.copy(positions[i]);
+      s.userData = { lineId: ln.id, wpIndex: i };
+      group.add(s);
+    }
+    linesGroup.add(group);
+  }
+}
+
+function rebuildStations() {
+  clearGroup(stationsGroup);
+  // place a station at every waypoint endpoint
+  const seen = new Set();
+  for (const ln of data.lines) {
+    for (let i = 0; i < ln.waypoints.length; i++) {
+      const wp = ln.waypoints[i];
+      const key = `${wp.gx},${wp.gy},${wp.plane}`;
+      const isEnd = (i === 0 || i === ln.waypoints.length - 1);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      // count incidences (rough interchange heuristic)
+      let count = 0;
+      for (const ln2 of data.lines) {
+        for (const wp2 of ln2.waypoints) {
+          if (wp2.gx === wp.gx && wp2.gy === wp.gy && wp2.plane === wp.plane)
+            count++;
+        }
+      }
+      const r = count > 1 ? INTERCHANGE_R : STATION_R;
+      const outer = new THREE.Mesh(
+        new THREE.CylinderGeometry(r, r, 0.05, 16),
+        new THREE.MeshBasicMaterial({ color: 0x111111 }));
+      outer.position.copy(wpToWorld(wp));
+      outer.position.y += 0.04;
+      stationsGroup.add(outer);
+      const inner = new THREE.Mesh(
+        new THREE.CylinderGeometry(r * 0.7, r * 0.7, 0.06, 16),
+        new THREE.MeshBasicMaterial({ color: 0xffffff }));
+      inner.position.copy(outer.position);
+      inner.position.y += 0.005;
+      stationsGroup.add(inner);
+    }
+  }
+}
+
+function rebuildLifts() {
+  clearGroup(liftsGroup);
+  for (const lf of data.lifts) {
+    const a = wpToWorld(lf.a);
+    const b = wpToWorld(lf.b);
+    const dir = new THREE.Vector3().subVectors(b, a);
+    const len = dir.length();
+    if (len < 1e-6) continue;
+    const cyl = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.05, 0.05, len, 6),
+      new THREE.MeshBasicMaterial({ color: 0x3a3a3a }));
+    cyl.position.copy(a).addScaledVector(dir, 0.5);
+    cyl.quaternion.setFromUnitVectors(
+      new THREE.Vector3(0,1,0), dir.clone().normalize());
+    liftsGroup.add(cyl);
+  }
+}
+
+function rebuildHover() {
+  clearGroup(editGroup);
+  // lift in progress: ring around the first picked waypoint
+  if (liftPending && mode === 'lift') {
+    const ln = data.lines.find(l => l.id === liftPending.lineId);
+    if (ln) {
+      const wp = ln.waypoints[liftPending.wpIndex];
+      const ring = new THREE.Mesh(
+        new THREE.TorusGeometry(0.32, 0.05, 8, 24),
+        new THREE.MeshBasicMaterial({ color: 0x222222 }));
+      ring.position.copy(wpToWorld(wp));
+      ring.rotation.x = Math.PI / 2;
+      editGroup.add(ring);
+    }
+  }
+  if (!hoverCell || mode !== 'draw') return;
+  const ln = data.lines.find(l => l.id === activeLineId);
+  if (!ln) return;
+  const wpPos = wpToWorld({...hoverCell});
+  // octolinear guide rays from the last waypoint on this plane
+  const lastWp = [...ln.waypoints].reverse().find(w => w.plane === hoverCell.plane);
+  if (lastWp) {
+    const dirs = [[1,0],[1,1],[0,1],[-1,1],[-1,0],[-1,-1],[0,-1],[1,-1]];
+    for (const [dx, dy] of dirs) {
+      const a = wpToWorld(lastWp);
+      const b = wpToWorld({ gx: lastWp.gx + dx*8, gy: lastWp.gy + dy*8, plane: lastWp.plane });
+      const dir = new THREE.Vector3().subVectors(b, a);
+      const len = dir.length();
+      const cyl = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.015, 0.015, len, 4),
+        new THREE.MeshBasicMaterial({ color: 0x666666, transparent: true, opacity: 0.25 }));
+      cyl.position.copy(a).addScaledVector(dir, 0.5);
+      cyl.quaternion.setFromUnitVectors(
+        new THREE.Vector3(0,1,0), dir.clone().normalize());
+      editGroup.add(cyl);
+    }
+  }
+  // dashed line from last waypoint of active line on this plane to hover
+  if (lastWp) {
+    const a = wpToWorld(lastWp);
+    const dir = new THREE.Vector3().subVectors(wpPos, a);
+    const len = dir.length();
+    if (len > 1e-6) {
+      const cyl = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.06, 0.06, len, 6),
+        new THREE.MeshBasicMaterial({ color: ln.color, transparent: true, opacity: 0.5 }));
+      cyl.position.copy(a).addScaledVector(dir, 0.5);
+      cyl.quaternion.setFromUnitVectors(
+        new THREE.Vector3(0,1,0), dir.clone().normalize());
+      editGroup.add(cyl);
+    }
+  }
+  // ghost waypoint
+  const ghost = new THREE.Mesh(
+    new THREE.SphereGeometry(0.18, 12, 12),
+    new THREE.MeshBasicMaterial({ color: ln.color, transparent: true, opacity: 0.55 }));
+  ghost.position.copy(wpPos);
+  editGroup.add(ghost);
+}
+
+function rebuildAll() {
+  buildPlanes();
+  rebuildLines();
+  rebuildStations();
+  rebuildLifts();
+  rebuildHover();
+  rebuildUI();
+}
+// raycaster-based interaction
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+function setMouse(ev) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+}
+
+function pickWaypoint() {
+  const hits = raycaster.intersectObjects(linesGroup.children, true);
+  for (const h of hits) {
+    if (h.object.userData && h.object.userData.lineId !== undefined &&
+        h.object.userData.wpIndex !== undefined) {
+      return { lineId: h.object.userData.lineId,
+               wpIndex: h.object.userData.wpIndex };
+    }
+  }
+  return null;
+}
+
+function pickPlaneCell() {
+  const hits = raycaster.intersectObject(planeMeshes[activePlane]);
+  if (!hits.length) return null;
+  const p = hits[0].point;
+  return { gx: Math.round(p.x), gy: Math.round(p.z), plane: activePlane };
+}
+
+function octolinearSnap(from, to) {
+  // snap "to" so that segment from->to is one of 8 directions, integer length
+  const dx = to.gx - from.gx;
+  const dy = to.gy - from.gy;
+  if (dx === 0 || dy === 0) return to;
+  const adx = Math.abs(dx), ady = Math.abs(dy);
+  if (adx === ady) return to;
+  // pick whichever axis or 45 is closest
+  const candidates = [
+    { gx: from.gx + dx, gy: from.gy, plane: to.plane },         // east-west
+    { gx: from.gx, gy: from.gy + dy, plane: to.plane },         // north-south
+    { gx: from.gx + Math.sign(dx) * Math.min(adx, ady),
+      gy: from.gy + Math.sign(dy) * Math.min(adx, ady),
+      plane: to.plane },                                         // 45 short
+    { gx: from.gx + Math.sign(dx) * Math.max(adx, ady),
+      gy: from.gy + Math.sign(dy) * Math.max(adx, ady),
+      plane: to.plane },                                         // 45 long
+  ];
+  let best = candidates[0], bestD = 1e9;
+  for (const c of candidates) {
+    const d = (c.gx - to.gx) ** 2 + (c.gy - to.gy) ** 2;
+    if (d < bestD) { bestD = d; best = c; }
+  }
+  return best;
+}
+
+renderer.domElement.addEventListener('mousemove', (ev) => {
+  setMouse(ev);
+  raycaster.setFromCamera(mouse, camera);
+  if (dragging) {
+    const cell = pickPlaneCell();
+    if (cell) {
+      const ln = data.lines.find(l => l.id === dragging.lineId);
+      if (ln) {
+        ln.waypoints[dragging.wpIndex] = cell;
+        rebuildLines();
+        rebuildStations();
+        rebuildHover();
+      }
+    }
+    return;
+  }
+  const newHover = pickPlaneCell();
+  if (JSON.stringify(newHover) !== JSON.stringify(hoverCell)) {
+    hoverCell = newHover;
+    rebuildHover();
+    updateHud();
+  }
+});
+
+renderer.domElement.addEventListener('mousedown', (ev) => {
+  if (ev.button !== 0) return;
+  setMouse(ev);
+  raycaster.setFromCamera(mouse, camera);
+
+  if (mode === 'move') {
+    const wp = pickWaypoint();
+    if (wp) {
+      dragging = wp;
+      activeLineId = wp.lineId;
+      rebuildUI();
+      controls.enabled = false;
+      ev.preventDefault();
+      return;
+    }
+  }
+
+  if (mode === 'delete') {
+    const wp = pickWaypoint();
+    if (wp) {
+      const ln = data.lines.find(l => l.id === wp.lineId);
+      ln.waypoints.splice(wp.wpIndex, 1);
+      rebuildAll();
+      ev.preventDefault();
+      return;
+    }
+  }
+
+  if (mode === 'draw') {
+    const cell = pickPlaneCell();
+    if (!cell) return;
+    const ln = data.lines.find(l => l.id === activeLineId);
+    if (!ln) return;
+    let target = cell;
+    const lastWp = [...ln.waypoints].reverse().find(w => w.plane === cell.plane);
+    if (lastWp && ev.shiftKey === false) {
+      target = octolinearSnap(lastWp, cell);
+    }
+    ln.waypoints.push(target);
+    rebuildAll();
+    ev.preventDefault();
+    return;
+  }
+
+  if (mode === 'bend') {
+    // pick the closest line segment under the cursor and insert a waypoint
+    const cell = pickPlaneCell();
+    if (!cell) return;
+    let best = null, bestD = 0.5;
+    for (let li = 0; li < data.lines.length; li++) {
+      const ln = data.lines[li];
+      for (let i = 0; i < ln.waypoints.length - 1; i++) {
+        const a = ln.waypoints[i], b = ln.waypoints[i + 1];
+        if (a.plane !== cell.plane || b.plane !== cell.plane) continue;
+        // distance from cell to segment a-b in grid space
+        const dx = b.gx - a.gx, dy = b.gy - a.gy;
+        const lenSq = dx*dx + dy*dy;
+        if (lenSq < 1e-6) continue;
+        let t = ((cell.gx - a.gx) * dx + (cell.gy - a.gy) * dy) / lenSq;
+        t = Math.max(0.05, Math.min(0.95, t));
+        const px = a.gx + t * dx, py = a.gy + t * dy;
+        const d = Math.hypot(cell.gx - px, cell.gy - py);
+        if (d < bestD) { bestD = d; best = { li, i }; }
+      }
+    }
+    if (best) {
+      const ln = data.lines[best.li];
+      ln.waypoints.splice(best.i + 1, 0, cell);
+      activeLineId = ln.id;
+      rebuildAll();
+      ev.preventDefault();
+    }
+    return;
+  }
+
+  if (mode === 'lift') {
+    const wp = pickWaypoint();
+    if (!wp) return;
+    if (!liftPending) {
+      liftPending = wp;
+      rebuildHover();
+    } else {
+      const a = data.lines.find(l => l.id === liftPending.lineId).waypoints[liftPending.wpIndex];
+      const b = data.lines.find(l => l.id === wp.lineId).waypoints[wp.wpIndex];
+      if (a.plane !== b.plane) {
+        data.lifts.push({ a: {...a}, b: {...b} });
+      }
+      liftPending = null;
+      rebuildAll();
+    }
+    ev.preventDefault();
+    return;
+  }
+});
+
+renderer.domElement.addEventListener('mouseup', () => {
+  dragging = null;
+  controls.enabled = true;
+});
+
+window.addEventListener('keydown', (ev) => {
+  if (ev.target.tagName === 'INPUT') return;
+  if (ev.key === 'd') { mode = 'draw'; rebuildUI(); }
+  if (ev.key === 'm') { mode = 'move'; rebuildUI(); }
+  if (ev.key === 'x') { mode = 'delete'; rebuildUI(); }
+  if (ev.key === '1') { activePlane = 0; rebuildAll(); }
+  if (ev.key === '2') { activePlane = 1; rebuildAll(); }
+  if (ev.key === '3') { activePlane = 2; rebuildAll(); }
+  if (ev.key === 'Escape') {
+    const ln = data.lines.find(l => l.id === activeLineId);
+    if (ln && ln.waypoints.length > 0) {
+      ln.waypoints.pop();
+      rebuildAll();
+    }
+  }
+});
+// sidebar UI
+const sidebarLines = document.getElementById('line-list');
+const modeRow = document.getElementById('mode-row');
+const planeRow = document.getElementById('plane-row');
+const hud = document.getElementById('hud');
+
+function rebuildUI() {
+  // mode buttons
+  modeRow.innerHTML = '';
+  for (const m of ['draw','bend','move','delete','lift']) {
+    const btn = document.createElement('button');
+    btn.className = 'btn' + (mode === m ? ' active' : '');
+    btn.textContent = m;
+    btn.onclick = () => { mode = m; rebuildUI(); };
+    modeRow.appendChild(btn);
+  }
+  // plane buttons
+  planeRow.innerHTML = '';
+  PLANES.forEach((p, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'btn' + (activePlane === i ? ' active' : '');
+    btn.textContent = (i+1) + ': ' + p.name;
+    btn.onclick = () => { activePlane = i; rebuildAll(); };
+    planeRow.appendChild(btn);
+  });
+  // line list
+  sidebarLines.innerHTML = '';
+  for (const ln of data.lines) {
+    const row = document.createElement('div');
+    row.className = 'line-item' + (ln.id === activeLineId ? ' active' : '');
+    row.style.borderLeftColor = ln.color;
+    row.onclick = () => { activeLineId = ln.id; rebuildUI(); };
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = ln.color;
+    swatch.onclick = (e) => {
+      e.stopPropagation();
+      const next = prompt('color hex (e.g. #ff8800)', ln.color);
+      if (next) { ln.color = next; rebuildAll(); }
+    };
+    row.appendChild(swatch);
+    const name = document.createElement('input');
+    name.value = ln.name;
+    name.onchange = () => { ln.name = name.value; };
+    row.appendChild(name);
+    const del = document.createElement('span');
+    del.textContent = ' x ';
+    del.style.cursor = 'pointer';
+    del.onclick = (e) => {
+      e.stopPropagation();
+      if (!confirm(`delete line ${ln.name}?`)) return;
+      data.lines = data.lines.filter(l => l.id !== ln.id);
+      if (activeLineId === ln.id && data.lines.length)
+        activeLineId = data.lines[0].id;
+      rebuildAll();
+    };
+    row.appendChild(del);
+    sidebarLines.appendChild(row);
+  }
+}
+
+document.getElementById('new-line').onclick = () => {
+  const id = 'l' + Date.now().toString(36);
+  const used = new Set(data.lines.map(l => l.color));
+  const color = palette.find(c => !used.has(c)) || palette[data.lines.length % palette.length];
+  data.lines.push({ id, name: 'NEW', color, waypoints: [] });
+  activeLineId = id;
+  mode = 'draw';
+  rebuildAll();
+};
+
+function updateHud() {
+  let html = `mode <b>${mode}</b> &middot; plane <b>${PLANES[activePlane].name}</b><br>`;
+  const ln = data.lines.find(l => l.id === activeLineId);
+  if (ln) html += `line <b style="color:${ln.color}">${ln.name}</b> &middot; ${ln.waypoints.length} wps<br>`;
+  if (mode === 'lift' && liftPending) html += `lift: pick second station on a different plane<br>`;
+  if (hoverCell) html += `cell ${hoverCell.gx}, ${hoverCell.gy}`;
+  hud.innerHTML = html;
+}
+function exportSvg() {
+  const COS30 = Math.cos(Math.PI/6), SIN30 = Math.sin(Math.PI/6);
+  const GRID = 46, PG = 210;
+  const proj = (gx, gy, plane) => {
+    const wx = gx * GRID, wy = gy * GRID;
+    return [(wx - wy) * COS30, (wx + wy) * SIN30 - plane * PG];
+  };
+  const corridors = buildCorridors();
+  const offsetWp = (line, i) => {
+    const w = line.waypoints[i];
+    const o = waypointOffset(line, i, corridors);
+    return proj(w.gx + o.x, w.gy + o.y, w.plane);
+  };
+  const allPts = [];
+  for (const ln of data.lines)
+    for (let i = 0; i < ln.waypoints.length; i++)
+      allPts.push(offsetWp(ln, i));
+  if (!allPts.length) return;
+  let minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9;
+  for (const p of allPts) { minx=Math.min(minx,p[0]); maxx=Math.max(maxx,p[0]);
+    miny=Math.min(miny,p[1]); maxy=Math.max(maxy,p[1]); }
+  const pad = 80; minx -= pad; maxx += pad; miny -= pad; maxy += pad;
+  const parts = [
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="' + minx.toFixed(1) + ' ' +
+      miny.toFixed(1) + ' ' + (maxx-minx).toFixed(1) + ' ' + (maxy-miny).toFixed(1) +
+      '" width="1400" font-family="Inter, Helvetica, Arial, sans-serif">',
+    '<rect x="' + minx + '" y="' + miny + '" width="' + (maxx-minx) +
+      '" height="' + (maxy-miny) + '" fill="#faf8f3"/>',
+  ];
+  PLANES.forEach((p, i) => {
+    const tints = ['#f0eadf','#ece5d6','#e8e0cd'];
+    const corners = [[-9,-6],[9,-6],[9,7],[-9,7]];
+    const c = corners.map(c => proj(c[0], c[1], i)).map(p => p.join(',')).join(' ');
+    parts.push('<polygon points="' + c + '" fill="' + tints[i] +
+      '" stroke="#cdbf9c" stroke-width="0.6" opacity="0.6"/>');
+  });
+  // lifts dashed
+  for (const lf of data.lifts) {
+    const a = proj(lf.a.gx, lf.a.gy, lf.a.plane);
+    const b = proj(lf.b.gx, lf.b.gy, lf.b.plane);
+    parts.push('<line x1="' + a[0].toFixed(1) + '" y1="' + a[1].toFixed(1) +
+      '" x2="' + b[0].toFixed(1) + '" y2="' + b[1].toFixed(1) +
+      '" stroke="#3a3a3a" stroke-width="2.4" stroke-dasharray="3.5,3" stroke-linecap="round"/>');
+  }
+  for (const ln of data.lines) {
+    if (ln.waypoints.length < 2) continue;
+    const d = ln.waypoints.map((_, i) => offsetWp(ln, i).map(n => n.toFixed(1)).join(',')).join(' ');
+    parts.push('<polyline points="' + d + '" fill="none" stroke="' + ln.color +
+      '" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>');
+  }
+  const seen = new Set();
+  for (const ln of data.lines) for (const wp of ln.waypoints) {
+    const k = wp.gx + ',' + wp.gy + ',' + wp.plane;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    const [x, y] = proj(wp.gx, wp.gy, wp.plane);
+    parts.push('<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) +
+      '" r="6" fill="#fff" stroke="#111" stroke-width="2"/>');
+  }
+  parts.push('</svg>');
+  const blob = new Blob([parts.join('\n')], { type: 'image/svg+xml' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'transit_map.svg'; a.click();
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById('export').onclick = exportSvg;
+document.getElementById('save').onclick = () => {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'transit_map.json'; a.click();
+  URL.revokeObjectURL(url);
+};
+document.getElementById('load-input').addEventListener('change', (ev) => {
+  const f = ev.target.files[0]; if (!f) return;
+  const r = new FileReader();
+  r.onload = () => {
+    try {
+      const loaded = JSON.parse(r.result);
+      data.lines = loaded.lines || [];
+      data.stations = loaded.stations || [];
+      data.lifts = loaded.lifts || [];
+      if (data.lines.length) activeLineId = data.lines[0].id;
+      rebuildAll();
+    } catch(e) { alert('bad json: ' + e.message); }
+  };
+  r.readAsText(f);
+});
+
+window.addEventListener('resize', () => {
+  const a = aspect();
+  camera.left = -FRUSTUM*a/2; camera.right = FRUSTUM*a/2;
+  camera.top = FRUSTUM/2; camera.bottom = -FRUSTUM/2;
+  camera.updateProjectionMatrix();
+  renderer.setSize(container.clientWidth, container.clientHeight);
+});
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  updateHud();
+  renderer.render(scene, camera);
+}
+
+rebuildAll();
+animate();
+</script>
+</body>
+</html>
+</textarea>
+<script>
+(function(){
+  const html = document.getElementById('iso-editor-src').value;
+  const blob = new Blob([html], { type: 'text/html' });
+  const url = URL.createObjectURL(blob);
+  document.getElementById('iso-editor-frame').src = url;
+})();
+</script>
+</div>
