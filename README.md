@@ -1,5 +1,7 @@
 # iso-metro
 
+<img width="2047" height="793" alt="image" src="https://github.com/user-attachments/assets/517856dc-e3e7-4fbf-a838-f8c29a8ad558" />
+
 An isometric octolinear transit map editor in the style of Maxwell Roberts.
 Stacked plane geometry, parallel corridor offsets, stadium interchange
 markers, terminus tabs, automatic label collision avoidance, and CSS-themed
